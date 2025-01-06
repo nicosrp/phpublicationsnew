@@ -1,32 +1,36 @@
 import streamlit as st
+import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
-from pymongo import MongoClient
-from datetime import datetime
 
-# MongoDB connection
-client = MongoClient("mongodb+srv://nicosherpa:Alibaba1320!!@publications.2gdpx.mongodb.net/plasticheal?retryWrites=true&w=majority&tls=true&tlsAllowInvalidCertificates=true")  # Use Streamlit Secrets for secure URI storage
-db = client["plasticheal"]  # Replace with your MongoDB database name
-collection = db["word_counts"]  # Replace with your MongoDB collection name
+# Connect to the SQLite database
+db_path = 'word_counts.db'
+conn = sqlite3.connect(db_path)
 
-# Load publication data for min and max dates
-publication_data = pd.DataFrame(list(collection.find({}, {"Publication Title": 1, "Publication Date": 1, "Project Name": 1, "Publication File": 1})))
+# Load publication data to get the correct min and max publication dates and PDF links
+publication_data = pd.read_excel("publications_list.xlsx")
 publication_data['Publication Date'] = pd.to_datetime(publication_data['Publication Date'], errors='coerce')
 min_date = publication_data['Publication Date'].min().strftime('%d.%m.%Y')
 max_date = publication_data['Publication Date'].max().strftime('%d.%m.%Y')
 
-# General statistics
-total_papers = collection.distinct("Publication")
-total_projects = collection.distinct("Project")
-total_words = collection.aggregate([{"$group": {"_id": None, "TotalWords": {"$sum": "$Count"}}}])
-formatted_total_words = f"{list(total_words)[0]['TotalWords']:,}"
+# General statistics from the database
+query_total_papers = "SELECT COUNT(DISTINCT Publication) as TotalPapers FROM WordCounts"
+query_total_projects = "SELECT COUNT(DISTINCT Project) as TotalProjects FROM WordCounts"
+query_total_words = "SELECT SUM(Count) as TotalWords FROM WordCounts"
+
+total_papers = pd.read_sql_query(query_total_papers, conn).iloc[0, 0]
+total_projects = pd.read_sql_query(query_total_projects, conn).iloc[0, 0]
+total_words = pd.read_sql_query(query_total_words, conn).iloc[0, 0]
+
+# Format word count with commas for readability
+formatted_total_words = f"{total_words:,}"
 
 # Display title and general dataset statistics
 st.title("Publication Word Frequency Analysis")
 st.write("Analyze word frequency across different projects and publications.")
 st.write("### Dataset Summary")
-st.write(f"- **Total Papers Investigated**: {len(total_papers)}")
-st.write(f"- **Number of Projects**: {len(total_projects)}")
+st.write(f"- **Total Papers Investigated**: {total_papers}")
+st.write(f"- **Number of Projects**: {total_projects}")
 st.write(f"- **Time Frame**: {min_date} to {max_date}")
 st.write(f"- **Total Words Investigated**: {formatted_total_words}")
 
@@ -35,32 +39,38 @@ word = st.text_input("Enter a word to analyze", "").strip().lower()
 
 # If word is entered, proceed with the analysis
 if word:
-    # Query MongoDB for word count data
-    word_data = pd.DataFrame(list(collection.aggregate([
-        {"$match": {"Word": word}},
-        {"$group": {"_id": "$Publication", "TotalCount": {"$sum": "$Count"}}}
-    ])))
-    word_data.rename(columns={"_id": "Publication"}, inplace=True)
+    # Query word count data
+    query = '''
+        SELECT Publication, SUM(Count) as TotalCount
+        FROM WordCounts 
+        WHERE Word = ? 
+        GROUP BY Publication
+        ORDER BY Publication
+    '''
+    word_data = pd.read_sql_query(query, conn, params=(word,))
 
-    # Merge with publication data for additional details
-    word_data = word_data.merge(publication_data, left_on="Publication", right_on="Publication Title", how="left")
+    # Merge word_data with publication_data to ensure we use Publication Date and Project Name
+    word_data = word_data.merge(
+        publication_data[['Publication Title', 'Publication Date', 'Project Name', 'Publication File']],
+        left_on='Publication', right_on='Publication Title', how='left'
+    )
     word_data.rename(columns={'Publication Date': 'PubDate', 'Publication File': 'Link', 'Project Name': 'Project'}, inplace=True)
-
+    
     if not word_data.empty:
         # Extract year from the actual publication date
         word_data['Year'] = pd.to_datetime(word_data['PubDate'], errors='coerce').dt.year
         word_data.dropna(subset=['Year'], inplace=True)
-
+        
         # Format the "Publication Date" column to DD.MM.YYYY
         word_data['PubDate'] = word_data['PubDate'].dt.strftime('%d.%m.%Y')
-
+        
         # Group data by Year for time-series analysis based on publication date
         year_data = word_data.groupby('Year')['TotalCount'].sum().reset_index()
 
         # Plotting the time-series graph of word occurrences over the years with Plotly
         st.subheader(f"Word count over the years for '{word}'")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(
+        fig.add_traoccce(go.Scatter(
             x=year_data['Year'],
             y=year_data['TotalCount'],
             mode='lines+markers',
@@ -103,18 +113,20 @@ st.write("### Comparison and Accumulation")
 accumulation_input = st.text_input("Enter words to compare and accumulate, separated by semicolons (;) for groups, use ';;' to separate groups", "").strip().lower()
 
 if accumulation_input:
-    groups = [[w.strip() for w in g.split(";") if w.strip()] for g in accumulation_input.split(";;") if g.strip()]
+    groups = [[word.strip() for word in group.split(";") if word.strip()] for group in accumulation_input.split(";;") if group.strip()]
     fig = go.Figure()
 
     for i, words in enumerate(groups):
         accumulation_data = pd.DataFrame()
 
         for word in words:
-            word_data = pd.DataFrame(list(collection.aggregate([
-                {"$match": {"Word": word}},
-                {"$group": {"_id": "$Publication", "TotalCount": {"$sum": "$Count"}}}
-            ])))
-            word_data.rename(columns={"_id": "Publication"}, inplace=True)
+            query = '''
+                SELECT Publication, SUM(Count) as TotalCount
+                FROM WordCounts 
+                WHERE Word = ? 
+                GROUP BY Publication
+            '''
+            word_data = pd.read_sql_query(query, conn, params=(word,))
             word_data = word_data.merge(publication_data[['Publication Title', 'Publication Date']],
                                         left_on='Publication', right_on='Publication Title', how='left')
             word_data['Year'] = pd.to_datetime(word_data['Publication Date'], errors='coerce').dt.year
@@ -125,6 +137,7 @@ if accumulation_input:
             else:
                 accumulation_data = accumulation_data.merge(year_data, on='Year', how='outer').fillna(0)
 
+        # Sum all words' counts in the group for accumulation
         accumulation_data[f'Accumulated_Group_{i+1}'] = accumulation_data[words].sum(axis=1)
 
         # Add the accumulated line for this group to the plot with hover data
@@ -136,11 +149,12 @@ if accumulation_input:
             line=dict(width=2),
             name=f"Group {i + 1} ({', '.join(words)})",
             hovertemplate="<b>Year</b>: %{x}<br>" +
-                          "".join([f"<b>{w}</b>: %{{customdata[{j}]}}<br>" for j, w in enumerate(words)]) +
+                          "".join([f"<b>{word}</b>: %{{customdata[{j}]}}<br>" for j, word in enumerate(words)]) +
                           f"<b>Total Accumulated</b>: %{{y}}<extra></extra>",
-            customdata=accumulation_data[words].values
+            customdata=accumulation_data[words].values  # Custom data to display individual counts on hover
         ))
 
+    # Set layout for the accumulation plot
     fig.update_layout(
         title="Accumulated Word Count Over Time (Multiple Groups)",
         xaxis_title="Year",
@@ -152,5 +166,5 @@ if accumulation_input:
     
     st.plotly_chart(fig, use_container_width=True)
 
-# Close MongoDB connection
-client.close()
+# Close database connection
+conn.close()
